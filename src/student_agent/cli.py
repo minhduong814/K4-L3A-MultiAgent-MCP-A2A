@@ -38,26 +38,64 @@ async def _run(root: Path) -> None:
     for stale in output_root.glob("*.json"):
         stale.unlink()
     trace_path.unlink(missing_ok=True)
-    trace = TraceWriter(trace_path, contracts)
+    case_index = 0
+    failures_at_index = 0
+    while case_index < len(case_set.case_ids):
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                discovered_tools = await gateway.list_tools()
+                if not discovered_tools:
+                    raise RuntimeError("MCP Gateway returned no tools")
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                # Keep a healthy session for as many cases as possible. If the
+                # stream drops, completed cases remain checkpointed and the next
+                # connection resumes at the first unfinished case.
+                while case_index < len(case_set.case_ids):
+                    case_id = case_set.case_ids[case_index]
+                    case = case_set.cases[case_id]
+                    case_trace_path = trace_path.with_name(f".{case_id}.jsonl.tmp")
+                    case_trace_path.unlink(missing_ok=True)
+                    case_trace = TraceWriter(case_trace_path, contracts)
+                    try:
+                        case_trace.emit(
+                            case_id=case_id,
+                            event_type="case_received",
+                            actor="coordinator",
+                        )
+                        output = await solve_case(case, gateway, case_trace)
+                        contracts.validate_output(output, f"outputs/{case_id}.json")
+                        if output.get("case_id") != case_id:
+                            raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                        case_trace.emit(
+                            case_id=case_id,
+                            event_type="case_finalized",
+                            actor="coordinator",
+                        )
+                    except Exception:
+                        case_trace_path.unlink(missing_ok=True)
+                        raise
+
+                    target = output_root / f"{case_id}.json"
+                    temporary = target.with_suffix(".json.tmp")
+                    temporary.write_text(
+                        json.dumps(output, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    temporary.replace(target)
+                    with trace_path.open("a", encoding="utf-8") as destination:
+                        destination.write(case_trace_path.read_text(encoding="utf-8"))
+                    case_trace_path.unlink(missing_ok=True)
+                    case_index += 1
+                    failures_at_index = 0
+        except Exception:
+            if case_index >= len(case_set.case_ids):
+                return
+            failures_at_index += 1
+            if failures_at_index >= 4:
+                raise
+            await asyncio.sleep(2 ** (failures_at_index - 1))
 
 
 def parser() -> argparse.ArgumentParser:

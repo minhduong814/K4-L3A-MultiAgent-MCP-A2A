@@ -16,15 +16,24 @@ class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self._available_tools: frozenset[str] | None = None
 
     async def list_tools(self) -> list[str]:
         response = await self._session.list_tools()
-        return sorted(tool.name for tool in response.tools)
+        tools = sorted(tool.name for tool in response.tools)
+        self._available_tools = frozenset(tools)
+        return tools
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        if self._available_tools is not None and tool_name not in self._available_tools:
+            raise RuntimeError(f"MCP tool was not discovered: {tool_name}")
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        # MCP v2 exposes snake_case model attributes.  Keep the camelCase
+        # fallback for compatibility with older SDK releases used by some
+        # competition environments.
+        is_error = getattr(result, "is_error", getattr(result, "isError", False))
+        if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
