@@ -52,7 +52,13 @@ async def solve_case(
 
     # Only query domains capable of proving or disproving the submitted claim. This
     # keeps the final evidence set precise while still covering every material fact.
-    need_items = claimed_issue in {"unavailable_order_paid", "valid_split_payment"}
+    need_items = claimed_issue in {
+        "unavailable_order_paid",
+        "late_delivery_seller",
+        "late_delivery_logistics",
+        "valid_split_payment",
+        "duplicate_charge",
+    }
     need_payment = claimed_issue not in {"late_delivery_seller", "late_delivery_logistics"}
     need_shipment = claimed_issue in {
         "late_delivery_seller",
@@ -92,7 +98,7 @@ async def solve_case(
     action = str(rule.get("recommended_action", "document_no_action"))
     case_status = str(rule.get("case_status", "needs_investigation"))
     refs = [value["evidence_ref"] for value in evidence.values()]
-    claim_assessments = _claim_assessments(claims, issue, refs)
+    claim_assessments = _claim_assessments(claims, issue, evidence)
     conflicts = _data_conflicts(order, evidence)
 
     refund_lines: list[dict[str, Any]] = []
@@ -128,7 +134,7 @@ async def solve_case(
         },
         "resolution_actions": [action],
     }
-    _verify_output(output)
+    _verify_output(output, issue=issue, evidence=evidence, rule=rule)
     trace.emit(
         case_id=case_id,
         event_type="handoff",
@@ -161,6 +167,68 @@ PRIMARY_ISSUES = {
     "refund_failed",
     "unsupported_claim",
     "insufficient_evidence",
+}
+
+REQUIRED_TOOLS = {
+    "canceled_order_paid": {"get_order", "get_payment_timeline", "get_policy"},
+    "unavailable_order_paid": {
+        "get_order",
+        "get_order_items",
+        "get_payment_timeline",
+        "get_policy",
+    },
+    "late_delivery_seller": {
+        "get_order",
+        "get_order_items",
+        "get_shipment_summary",
+        "get_policy",
+    },
+    "late_delivery_logistics": {
+        "get_order",
+        "get_order_items",
+        "get_shipment_summary",
+        "get_policy",
+    },
+    "valid_split_payment": {
+        "get_order",
+        "get_order_items",
+        "get_payment_timeline",
+        "get_policy",
+    },
+    "payment_mismatch": {"get_order", "get_payment_timeline", "get_policy"},
+    "duplicate_charge": {
+        "get_order",
+        "get_order_items",
+        "get_payment_timeline",
+        "get_policy",
+    },
+    "refund_pending": {
+        "get_order",
+        "get_payment_timeline",
+        "get_refund_timeline",
+        "get_policy",
+    },
+    "refund_failed": {
+        "get_order",
+        "get_payment_timeline",
+        "get_refund_timeline",
+        "get_policy",
+    },
+    "unsupported_claim": {
+        "get_order",
+        "get_payment_timeline",
+        "get_shipment_summary",
+        "get_policy",
+    },
+}
+
+EXPECTED_DOMAINS = {
+    "get_order": "order",
+    "get_order_items": "item",
+    "get_payment_timeline": "payment",
+    "get_refund_timeline": "refund",
+    "get_shipment_summary": "shipment",
+    "get_policy": "policy",
 }
 
 
@@ -236,7 +304,10 @@ def _assess_issue(
             return claimed_issue
     if claimed_issue in {"late_delivery_seller", "late_delivery_logistics"}:
         shipment = evidence.get("get_shipment_summary", {}).get("data", {})
-        actor = claimed_issue.removeprefix("late_delivery_")
+        actor = {
+            "late_delivery_seller": "seller",
+            "late_delivery_logistics": "logistics_provider",
+        }[claimed_issue]
         events = shipment.get("events", []) if isinstance(shipment, dict) else []
         if any(isinstance(event, dict) and event.get("actor") == actor for event in events):
             return claimed_issue
@@ -299,7 +370,7 @@ def _money(value: Any) -> Decimal:
 
 
 def _claim_assessments(
-    claims: list[Any], issue: str, evidence_refs: list[str]
+    claims: list[Any], issue: str, evidence: dict[str, dict[str, Any]]
 ) -> list[dict[str, Any]]:
     results = []
     for raw in claims[:5]:
@@ -324,6 +395,7 @@ def _claim_assessments(
             verdict = "unsupported"
         else:
             verdict = "supported" if topic == issue else "unsupported"
+        evidence_refs = _claim_evidence_refs(topic, issue, evidence)
         results.append(
             {
                 "claim_id": raw["claim_id"],
@@ -333,6 +405,35 @@ def _claim_assessments(
             }
         )
     return results
+
+
+def _claim_evidence_refs(
+    topic: Any, issue: str, evidence: dict[str, dict[str, Any]]
+) -> list[str]:
+    """Link each claim only to evidence that directly supports its verdict."""
+    if topic == "requested_full_refund":
+        tools = {"get_order", "get_policy"}
+        if "get_payment_timeline" in evidence:
+            tools.add("get_payment_timeline")
+        if issue in {"refund_pending", "refund_failed"}:
+            tools.add("get_refund_timeline")
+        if issue in {"late_delivery_seller", "late_delivery_logistics"}:
+            tools.update({"get_order_items", "get_shipment_summary"})
+    elif issue in {"canceled_order_paid", "unavailable_order_paid"}:
+        tools = {"get_order", "get_payment_timeline"}
+        if issue == "unavailable_order_paid":
+            tools.add("get_order_items")
+    elif issue in {"late_delivery_seller", "late_delivery_logistics"}:
+        tools = {"get_order", "get_order_items", "get_shipment_summary"}
+    elif issue in {"valid_split_payment", "duplicate_charge"}:
+        tools = {"get_order_items", "get_payment_timeline"}
+    elif issue == "payment_mismatch":
+        tools = {"get_payment_timeline"}
+    elif issue in {"refund_pending", "refund_failed"}:
+        tools = {"get_payment_timeline", "get_refund_timeline"}
+    else:
+        tools = {"get_order", "get_payment_timeline", "get_shipment_summary"}
+    return [value["evidence_ref"] for name, value in evidence.items() if name in tools]
 
 
 def _data_conflicts(
@@ -408,7 +509,13 @@ def _append_duplicate_conflicts(
             )
 
 
-def _verify_output(output: dict[str, Any]) -> None:
+def _verify_output(
+    output: dict[str, Any],
+    *,
+    issue: str | None = None,
+    evidence: dict[str, dict[str, Any]] | None = None,
+    rule: dict[str, Any] | None = None,
+) -> None:
     financial = output["financial_resolution"]
     line_total = sum(Decimal(str(line["amount_brl"])) for line in financial["refund_lines"])
     recommended = Decimal(str(financial["recommended_refund_brl"]))
@@ -418,3 +525,38 @@ def _verify_output(output: dict[str, Any]) -> None:
         raise ValueError("no_action cannot recommend a positive refund")
     if len(output["evidence_refs"]) != len(set(output["evidence_refs"])):
         raise ValueError("duplicate evidence references")
+    if issue is None or evidence is None or rule is None:
+        return
+
+    required = REQUIRED_TOOLS.get(issue)
+    if required is None or not required.issubset(evidence):
+        missing = sorted((required or set()) - set(evidence))
+        raise ValueError(f"missing required evidence tools for {issue}: {missing}")
+    for tool_name, value in evidence.items():
+        expected_domain = EXPECTED_DOMAINS.get(tool_name)
+        if expected_domain and value.get("domain") != expected_domain:
+            raise ValueError(f"{tool_name} returned domain {value.get('domain')!r}")
+
+    source_refs = {value["evidence_ref"] for value in evidence.values()}
+    if set(output["evidence_refs"]) != source_refs:
+        raise ValueError("output evidence does not exactly match consumed evidence")
+    for claim in output.get("claim_assessments", []):
+        if not set(claim["evidence_refs"]).issubset(source_refs):
+            raise ValueError("claim cites evidence outside the current case")
+
+    expected_action = rule.get("recommended_action")
+    if output["resolution_actions"] != [expected_action]:
+        raise ValueError("resolution action does not match the selected policy rule")
+    if output["assessment"]["case_status"] != rule.get("case_status"):
+        raise ValueError("case status does not match the selected policy rule")
+    expected_refund = _money(rule.get("refund_brl", 0))
+    if recommended != expected_refund:
+        raise ValueError("recommended refund does not match the selected policy rule")
+    if issue in {"late_delivery_seller", "unavailable_order_paid"}:
+        sellers = set(output["affected_entities"]["seller_ids"])
+        parties = output["root_cause_analysis"]["responsible_parties"]
+        if not sellers or any(
+            party["party_type"] != "seller" or party["party_id"] not in sellers
+            for party in parties
+        ):
+            raise ValueError("seller responsibility is not linked to affected evidence")

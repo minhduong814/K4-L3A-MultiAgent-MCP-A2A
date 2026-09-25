@@ -35,12 +35,17 @@ async def _run(root: Path) -> None:
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
-    case_index = 0
-    failures_at_index = 0
-    while case_index < len(case_set.case_ids):
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        # Evidence provenance is scoped to an MCP run. Never combine artifacts
+        # produced by different sessions in one submission: a reconnect restarts
+        # the complete case set with fresh evidence references.
+        for stale in output_root.glob("*.json"):
+            stale.unlink()
+        for stale_trace in trace_path.parent.glob(".*.jsonl.tmp"):
+            stale_trace.unlink()
+        trace_path.unlink(missing_ok=True)
+        case_index = 0
         try:
             async with connect_gateway(
                 settings.mcp_endpoint, settings.team_api_key, contracts
@@ -49,9 +54,6 @@ async def _run(root: Path) -> None:
                 if not discovered_tools:
                     raise RuntimeError("MCP Gateway returned no tools")
 
-                # Keep a healthy session for as many cases as possible. If the
-                # stream drops, completed cases remain checkpointed and the next
-                # connection resumes at the first unfinished case.
                 while case_index < len(case_set.case_ids):
                     case_id = case_set.case_ids[case_index]
                     case = case_set.cases[case_id]
@@ -88,14 +90,13 @@ async def _run(root: Path) -> None:
                         destination.write(case_trace_path.read_text(encoding="utf-8"))
                     case_trace_path.unlink(missing_ok=True)
                     case_index += 1
-                    failures_at_index = 0
+            return
         except Exception:
             if case_index >= len(case_set.case_ids):
                 return
-            failures_at_index += 1
-            if failures_at_index >= 4:
+            if attempt >= max_attempts:
                 raise
-            await asyncio.sleep(2 ** (failures_at_index - 1))
+            await asyncio.sleep(2 ** (attempt - 1))
 
 
 def parser() -> argparse.ArgumentParser:

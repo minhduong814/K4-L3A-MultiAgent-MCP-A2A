@@ -22,8 +22,9 @@ responsibility type, and refund amount. The verifier checks cross-field invarian
 before the coordinator returns an output.
 
 The CLI writes each case to temporary output and trace files and commits them only
-after the full case passes validation. A dropped MCP stream reconnects and resumes
-at the first uncommitted case, with four bounded attempts.
+after the full case passes validation. All 100 cases in one submission must come
+from one MCP session. If the stream drops, the CLI discards that attempt and restarts
+the complete case set in a fresh session, with four bounded attempts.
 
 ## 2. Agent ownership
 
@@ -73,7 +74,7 @@ refund, and policy evidence. Conflicting duplicate records are retained as decla
 
 | Failure | Retry? | Fallback | Trace event/code |
 | --- | --- | --- | --- |
-| MCP connection/stream failure | Yes, at most four attempts for the unfinished case | Reconnect and resume last committed checkpoint | Uncommitted temporary trace is discarded |
+| MCP connection/stream failure | Yes, at most four full-run attempts | Discard the attempt and restart all 100 cases in one fresh session | All partial artifacts are discarded |
 | Tool not discovered | No | Stop run; do not fabricate evidence | No finalized case |
 | Not found/invalid envelope | No | Stop run for correction or rerun | No finalized case |
 | Source conflict | No tool retry | Select timeline-aligned source and declare conflict | `verification_completed`, conflict count |
